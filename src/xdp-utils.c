@@ -1054,7 +1054,11 @@ xdp_app_info_get_path_for_fd (XdpAppInfo *app_info,
         }
     }
 
+#ifdef __linux__
   proc_path = g_strdup_printf ("/proc/self/fd/%d", fd);
+#elif defined(__FreeBSD__)
+  proc_path = g_strdup_printf ("/dev/fd/%d", fd);
+#endif
 
   /* Must be able to read valid path from /proc/self/fd */
   /* This is an absolute and (at least at open time) symlink-expanded path */

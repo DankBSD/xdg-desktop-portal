@@ -265,7 +265,11 @@ app_can_see_doc (PermissionDbEntry *entry, const char *app_id)
 static char *
 fd_to_path (int fd)
 {
+#ifdef __linux__
   return g_strdup_printf ("/proc/self/fd/%d", fd);
+#elif defined(__FreeBSD__)
+  return g_strdup_printf ("/dev/fd/%d", fd);
+#endif
 }
 
 static char *
