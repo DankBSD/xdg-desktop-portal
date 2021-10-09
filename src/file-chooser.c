@@ -116,7 +116,7 @@ send_response_in_thread_func (GTask        *task,
           ruri = register_document (uris[i], xdp_app_info_get_id (request->app_info), for_save, writable, directory, &error);
           if (ruri == NULL)
             {
-              g_warning ("Failed to register %s: %s", uris[i], error->message);
+              g_warning ("Failed to register %s: %s", uris[i], error ? error->message : "(unknown error)");
               continue;
             }
           g_debug ("convert uri %s -> %s\n", uris[i], ruri);
