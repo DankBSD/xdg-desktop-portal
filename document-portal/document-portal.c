@@ -636,6 +636,7 @@ app_has_file_access (const char *target_app_id,
   if (target_app_id == NULL || target_app_id[0] == '\0')
     return FALSE;
 
+#ifdef __linux__
   if (g_str_has_prefix (target_app_id, "snap."))
     {
       res = get_output (&error, "snap", "routine", "file-access",
@@ -647,6 +648,7 @@ app_has_file_access (const char *target_app_id,
       arg = g_strdup_printf ("--file-access=%s", path);
       res = get_output (&error, "flatpak", "info", arg, target_app_id, NULL);
     }
+#endif
 
   if (res)
     {
