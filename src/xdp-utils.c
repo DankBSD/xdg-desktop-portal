@@ -38,6 +38,13 @@
 #include <sys/mount.h>
 #endif
 
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include <libprocstat.h>
+#endif
+
 #include <gio/gdesktopappinfo.h>
 
 #include "xdp-utils.h"
@@ -119,6 +126,7 @@ typedef enum
   XDP_APP_INFO_KIND_HOST = 0,
   XDP_APP_INFO_KIND_FLATPAK = 1,
   XDP_APP_INFO_KIND_SNAP    = 2,
+  XDP_APP_INFO_KIND_DANKBOX = 69,
 } XdpAppInfoKind;
 
 struct _XdpAppInfo {
@@ -218,6 +226,7 @@ xdp_app_info_load_app_info (XdpAppInfo *app_info)
   switch (app_info->kind)
     {
     case XDP_APP_INFO_KIND_FLATPAK:
+    case XDP_APP_INFO_KIND_DANKBOX:
       desktop_id = g_strconcat (app_info->id, ".desktop", NULL);
       break;
 
@@ -401,6 +410,7 @@ ensure_app_info_by_unique_name (void)
                                                      (GDestroyNotify)xdp_app_info_unref);
 }
 
+#ifdef __linux__
 /* Returns NULL with error set on failure, NULL with no error set if not a flatpak, and app-info otherwise */
 static XdpAppInfo *
 parse_app_info_from_flatpak_info (int pid, GError **error)
@@ -636,6 +646,46 @@ parse_app_info_from_snap (pid_t pid, GError **error)
 
   return g_steal_pointer (&app_info);
 }
+#elif defined(__FreeBSD__)
+static XdpAppInfo *
+parse_app_info_from_dankbox (int pid, GError **error)
+{
+  XdpAppInfo *result = NULL;
+  unsigned int cnt;
+  fprintf(stderr, "appinfo %d pid\n", pid);
+
+  struct procstat *procstat = procstat_open_sysctl ();
+  struct kinfo_proc *kp = procstat_getprocs (procstat, KERN_PROC_PID, pid, &cnt);
+  if (cnt != 1)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "%d results for pid %u", cnt, pid);
+      goto out;
+    }
+
+	// TODO: pid can be for dbus proxy!
+
+  if (!(kp->ki_cr_flags & KI_CRF_CAPABILITY_MODE)){
+    goto out;
+  }
+
+  // TODO: check rtld
+
+  char **argv = procstat_getargv (procstat, kp, 0); // freed on close
+
+  if (!argv[0] || strncmp (argv[0], "dankbox:", 8) != 0)
+    goto out;
+
+  result = xdp_app_info_new (XDP_APP_INFO_KIND_DANKBOX);
+  result->id = strdup (argv[0] + 8);
+
+out:
+  if (kp)
+    procstat_freeprocs (procstat, kp);
+  procstat_close (procstat);
+  return result;
+}
+#endif
 
 
 XdpAppInfo *
@@ -645,6 +695,7 @@ xdp_get_app_info_from_pid (pid_t pid,
   g_autoptr(XdpAppInfo) app_info = NULL;
   g_autoptr(GError) local_error = NULL;
 
+#ifdef __linux__
   app_info = parse_app_info_from_flatpak_info (pid, &local_error);
   if (app_info == NULL && local_error)
     {
@@ -661,6 +712,14 @@ xdp_get_app_info_from_pid (pid_t pid,
           return NULL;
         }
     }
+#elif defined(__FreeBSD__)
+  app_info = parse_app_info_from_dankbox (pid, &local_error);
+  if (app_info == NULL && local_error)
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return NULL;
+    }
+#endif
 
   if (app_info == NULL)
     app_info = xdp_app_info_new_host ();

@@ -175,6 +175,8 @@ GLIB_TESTS
 
 PKG_CHECK_MODULES(FUSE, [fuse])
 
+LDFLAGS="$LDFLAGS -lprocstat"
+
 AC_CONFIG_FILES([
 Makefile
 xdg-desktop-portal.pc
