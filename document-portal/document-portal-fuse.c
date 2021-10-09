@@ -3157,7 +3157,7 @@ xdp_fuse_init (GError **error)
    *  atomic_o_trunc: We handle O_TRUNC in create()
    *  big_writes: Allow > 4k writes
    */
-  char *fusermount_argv[] = { "xdp-fuse", "-osubtype=portal,fsname=portal,auto_unmount,splice_read,splice_write,splice_move,atomic_o_trunc,big_writes" };
+  char *fusermount_argv[] = { "xdp-fuse", "-osubtype=portal,fsname=portal,splice_read,splice_write,splice_move,atomic_o_trunc,big_writes" };
   struct fuse_args args = FUSE_ARGS_INIT (G_N_ELEMENTS (fusermount_argv), fusermount_argv);
   struct stat st;
   struct statfs stfs;
