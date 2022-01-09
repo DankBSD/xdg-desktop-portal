@@ -262,15 +262,88 @@ app_can_see_doc (PermissionDbEntry *entry, const char *app_id)
   return FALSE;
 }
 
+#ifdef __linux__
 static char *
 fd_to_path (int fd)
 {
-#ifdef __linux__
   return g_strdup_printf ("/proc/self/fd/%d", fd);
+}
+#endif
+
+static int
+open_path_fd (int fd, int open_flags, int mode)
+{
+#ifdef __linux__
+  g_autofree char *path = fd_to_path (fd);
+  return open (path, open_flags, mode);
 #elif defined(__FreeBSD__)
-  return g_strdup_printf ("/dev/fd/%d", fd);
+  return openat (fd, "", open_flags | O_EMPTY_PATH | O_NOFOLLOW, mode);
 #endif
 }
+
+static int
+access_path_fd (int fd, int mask)
+{
+#ifdef __linux__
+  g_autofree char *path = fd_to_path (fd);
+  return access (path, mask);
+#elif defined(__FreeBSD__)
+  return faccessat (fd, "", mask, AT_EMPTY_PATH);
+#endif
+}
+
+static int
+utimens_path_fd (int fd, const struct timespec times[2], int flag)
+{
+#ifdef __linux__
+  g_autofree char *path = fd_to_path (fd);
+  return utimensat (AT_FDCWD, path, times, flag);
+#elif defined(__FreeBSD__)
+  return utimensat (fd, "", times, flag | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+#endif
+}
+
+static int
+chown_path_fd (int fd, uid_t owner, gid_t group)
+{
+#ifdef __linux__
+  g_autofree char *path = fd_to_path (fd);
+  return chown (path, uid, gid);
+#elif defined(__FreeBSD__)
+  return fchownat (fd, "", owner, group, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+#endif
+}
+
+static int
+chmod_path_fd (int fd, mode_t mode)
+{
+#ifdef __linux__
+  g_autofree char *path = fd_to_path (fd);
+  return chmod (path, mode);
+#elif defined(__FreeBSD__)
+  return fchmodat (fd, "", mode, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+#endif
+}
+
+static int
+lstat_and_realpath_path_fd (int fd, struct stat *buf, char *path_buffer)
+{
+#ifdef __linux__
+  g_autofree char *fd_path = fd_to_path (fd);
+  ssize_t symlink_size;
+  symlink_size = readlink (fd_path, path_buffer, PATH_MAX);
+  if (symlink_size >= 1)
+    {
+      path_buffer[symlink_size] = 0;
+      return lstat (path_buffer, &buf);
+    }
+  return -1;
+#elif defined(__FreeBSD__)
+  g_warning("TODO path");
+  return fstatat (fd, "", buf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+#endif
+}
+
 
 static char *
 open_flags_to_string (int flags)
@@ -1055,7 +1128,6 @@ create_tempfile (XdpInode *parent,
                   XdpTempfile **tempfile_out)
 {
   g_autoptr(XdpInode) inode = NULL;
-  g_autofree char *real_fd_path = NULL;
   xdp_autofd int real_fd = -1;
   xdp_autofd int o_path_fd = -1;
   g_autoptr(XdpTempfile) tempfile = NULL;
@@ -1069,8 +1141,7 @@ create_tempfile (XdpInode *parent,
   if (real_fd < 0)
     return real_fd;
 
-  real_fd_path = fd_to_path (real_fd);
-  o_path_fd = open (real_fd_path, O_PATH, 0);
+  o_path_fd = openat (dirfd, tmpname, O_PATH, 0);
   if (o_path_fd == -1)
     return -errno;
 
@@ -1170,8 +1241,7 @@ xdp_document_inode_open_child_fd (XdpInode *inode, const char *name, int open_fl
 
           if (tempfile)
             {
-              g_autofree char *fd_path = fd_to_path (tempfile->inode->physical->fd);
-              fd = open (fd_path, open_flags & ~(O_CREAT|O_EXCL|O_NOFOLLOW), mode);
+              fd = open_path_fd (tempfile->inode->physical->fd, open_flags & ~(O_CREAT|O_EXCL|O_NOFOLLOW), mode);
               if (fd == -1)
                 return -errno;
 
@@ -1188,6 +1258,7 @@ xdp_document_inode_open_child_fd (XdpInode *inode, const char *name, int open_fl
   return -ENOENT;
 }
 
+#if defined(HAVE_SYS_XATTR_H)
 /* Returns /proc/self/fds/$fd path for O_PATH fd or toplevel path */
 static char *
 xdp_document_inode_get_self_as_path (XdpInode *inode)
@@ -1203,6 +1274,7 @@ xdp_document_inode_get_self_as_path (XdpInode *inode)
       return g_strdup (inode->domain->doc_path);
     }
 }
+#endif
 
 static void
 tweak_statbuf_for_document_inode (XdpInode *inode,
@@ -1414,7 +1486,6 @@ xdp_fuse_setattr (fuse_req_t             req,
   /* Truncate */
   if (to_set & FUSE_SET_ATTR_SIZE)
     {
-      g_autofree char *path = NULL;
       XdpFile *file = (XdpFile *)fi->fh;
 
       if (file)
@@ -1425,10 +1496,16 @@ xdp_fuse_setattr (fuse_req_t             req,
         }
       else if (inode->physical)
         {
-          path = fd_to_path (inode->physical->fd);
-          res = truncate (path, attr->st_size);
-          if (res == -1)
+          int fd = open_path_fd (inode->physical->fd, O_WRONLY, 0);
+          if (fd == -1)
             res = -errno;
+          else
+            {
+              res = ftruncate (fd, attr->st_size);
+              if (res == -1)
+                res = -errno;
+              close(fd);
+            }
         }
       else
         {
@@ -1442,7 +1519,6 @@ xdp_fuse_setattr (fuse_req_t             req,
   if (to_set & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME))
     {
       struct timespec times[2] = { {0, UTIME_OMIT}, {0, UTIME_OMIT} }; /* 0 = atime, 1 = mtime */
-      g_autofree char *path = NULL;
 
       if (to_set & FUSE_SET_ATTR_ATIME_NOW)
         times[0].tv_nsec = UTIME_NOW;
@@ -1456,8 +1532,7 @@ xdp_fuse_setattr (fuse_req_t             req,
 
       if (inode->physical)
         {
-          path = fd_to_path (inode->physical->fd);
-          res = utimensat (AT_FDCWD, path, times, 0);
+          res = utimens_path_fd (inode->physical->fd, times, 0);
         }
       else
         res = utimensat (AT_FDCWD, inode->domain->doc_path, times, 0); /* follow symlink here */
@@ -1468,7 +1543,6 @@ xdp_fuse_setattr (fuse_req_t             req,
 
   if (to_set & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID))
     {
-      g_autofree char *path = NULL;
       uid_t uid = -1;
       gid_t gid = -1;
 
@@ -1480,8 +1554,7 @@ xdp_fuse_setattr (fuse_req_t             req,
 
       if (inode->physical)
         {
-          path = fd_to_path (inode->physical->fd);
-          res = chown (path, uid, gid);
+          res = chown_path_fd (inode->physical->fd, uid, gid);
           if (res == -1)
             res = -errno;
         }
@@ -1496,12 +1569,9 @@ xdp_fuse_setattr (fuse_req_t             req,
 
   if (to_set & (FUSE_SET_ATTR_MODE))
     {
-      g_autofree char *path = NULL;
-
       if (inode->physical)
         {
-          path = fd_to_path (inode->physical->fd);
-          res = chmod (path, attr->st_mode);
+          res = chmod_path_fd (inode->physical->fd, attr->st_mode);
           if (res == -1)
             res = -errno;
         }
@@ -1809,7 +1879,6 @@ xdp_fuse_open (fuse_req_t req,
   int open_flags = fi->flags;
   g_autofree char *open_flags_string = open_flags_to_string (open_flags);
   int fd;
-  g_autofree char *path = NULL;
   XdpFile *file = NULL;
   XdpDocumentChecks checks;
   const char *op = "OPEN";
@@ -1824,8 +1893,7 @@ xdp_fuse_open (fuse_req_t req,
   if (!xdp_document_inode_checks (op, req, inode, checks))
     return;
 
-  path = fd_to_path (inode->physical->fd);
-  fd = open (path, open_flags, 0);
+  fd = open_path_fd (inode->physical->fd, open_flags, 0);
   if (fd == -1)
     return xdp_reply_err (op, req, errno);
 
@@ -1853,7 +1921,6 @@ xdp_fuse_create (fuse_req_t             req,
   int res;
   xdp_autofd int fd = -1;
   xdp_autofd int o_path_fd = -1;
-  g_autofree char *fd_path = NULL;
   XdpFile *file = NULL;
   const char *op = "CREATE";
 
@@ -1868,8 +1935,7 @@ xdp_fuse_create (fuse_req_t             req,
   if (fd < 0)
     return xdp_reply_err (op, req, -fd);
 
-  fd_path = fd_to_path (fd);
-  o_path_fd = open (fd_path, O_PATH, 0);
+  o_path_fd = openat (fd, "", O_PATH | O_EMPTY_PATH, 0);
   if (o_path_fd < 0)
     return xdp_reply_err (op, req, errno);
 
@@ -2655,7 +2721,6 @@ xdp_fuse_access (fuse_req_t req,
                  int mask)
 {
   g_autoptr(XdpInode) inode = xdp_inode_from_ino (ino);
-  g_autofree char *path = NULL;
   int res;
   const char *op = "ACCESS";
 
@@ -2677,8 +2742,7 @@ xdp_fuse_access (fuse_req_t req,
 
   if (inode->physical)
     {
-      path = fd_to_path (inode->physical->fd);
-      res = access (path, mask);
+      res = access_path_fd (inode->physical->fd, mask);
     }
   else
     {
@@ -2821,6 +2885,7 @@ xdp_fuse_link (fuse_req_t req,
   if (inode->domain != newparent->domain)
     return xdp_reply_err (op, req, EXDEV);
 
+#ifdef __linux__
   proc_path = fd_to_path (inode->physical->fd);
   newparent_dirfd = xdp_document_inode_ensure_dirfd (newparent, &close_fd);
   if (newparent_dirfd < 0)
@@ -2836,6 +2901,9 @@ xdp_fuse_link (fuse_req_t req,
 
   if (fuse_reply_entry (req, &e) == -ENOENT)
     abort_reply_entry (&e);
+#elif defined(__FreeBSD__)
+  // XXX: linkat(AT_EMPTY_PATH) is root-only >_<
+#endif
 }
 
 
@@ -2874,7 +2942,6 @@ xdp_fuse_setxattr (fuse_req_t req,
 {
   g_autoptr(XdpInode) inode = xdp_inode_from_ino (ino);
   ssize_t res;
-  g_autofree char *path = NULL;
   const char *op = "SETXATTR";
 
   g_debug ("SETXATTR %lx %s", ino, name);
@@ -2885,11 +2952,11 @@ xdp_fuse_setxattr (fuse_req_t req,
                                   CHECK_IS_PHYSICAL))
     return;
 
-  path = fd_to_path (inode->physical->fd);
 #if defined(HAVE_SYS_XATTR_H)
+  g_autofree char *path = fd_to_path (inode->physical->fd);
   res = setxattr (path, name, value, size, flags);
 #elif defined(HAVE_SYS_EXTATTR_H)
-  res = extattr_set_file (path, EXTATTR_NAMESPACE_USER, name, value, size);
+  res = extattr_set_fd (inode->physical->fd, EXTATTR_NAMESPACE_USER, name, value, size);
 #else
 #error "Not implemented for your platform"
 #endif
@@ -2909,7 +2976,6 @@ xdp_fuse_getxattr (fuse_req_t req,
   g_autoptr(XdpInode) inode = xdp_inode_from_ino (ino);
   ssize_t res;
   g_autofree char *buf = NULL;
-  g_autofree char *path = NULL;
   const char *op = "GETXATTR";
 
   g_debug ("GETXATTR %lx %s %ld", ino, name, size);
@@ -2920,19 +2986,23 @@ xdp_fuse_getxattr (fuse_req_t req,
   if (size != 0)
     buf = g_malloc (size);
 
-  path = xdp_document_inode_get_self_as_path (inode);
+#if defined(HAVE_SYS_XATTR_H)
+  g_autofree char *path = xdp_document_inode_get_self_as_path (inode);
   if (path == NULL)
     res = ENODATA;
   else
-  {
-#if defined(HAVE_SYS_XATTR_H)
     res = getxattr (path, name, buf, size);
 #elif defined(HAVE_SYS_EXTATTR_H)
-    res = extattr_get_file (path, EXTATTR_NAMESPACE_USER, name, buf, size);
+  if (inode->physical)
+    res = extattr_get_fd (inode->physical->fd, EXTATTR_NAMESPACE_USER, name, buf, size);
+  else if (xdp_document_domain_is_dir (inode->domain))
+    res = ENODATA;
+  else
+    res = extattr_get_file (inode->domain->doc_path, EXTATTR_NAMESPACE_USER, name, buf, size);
 #else
 #error "Not implemented for your platform"
 #endif
-  }
+
   if (res < 0)
     return xdp_reply_err (op, req, errno);
 
@@ -2950,7 +3020,6 @@ xdp_fuse_listxattr (fuse_req_t req,
   g_autoptr(XdpInode) inode = xdp_inode_from_ino (ino);
   ssize_t res;
   g_autofree char *buf = NULL;
-  g_autofree char *path = NULL;
   const char *op = "LISTXATTR";
 
   g_debug ("LISTXATTR %lx %ld", ino, size);
@@ -2961,19 +3030,22 @@ xdp_fuse_listxattr (fuse_req_t req,
   if (size != 0)
     buf = g_malloc (size);
 
-  path = xdp_document_inode_get_self_as_path (inode);
-  if (path)
-  {
 #if defined(HAVE_SYS_XATTR_H)
+  g_autofree char *path = xdp_document_inode_get_self_as_path (inode);
+  if (path == NULL)
+    res = ENODATA;
+  else
     res = listxattr (path, buf, size);
 #elif defined(HAVE_SYS_EXTATTR_H)
-    res = extattr_list_file (path, EXTATTR_NAMESPACE_USER, buf, size);
+  if (inode->physical)
+    res = extattr_list_fd (inode->physical->fd, EXTATTR_NAMESPACE_USER, buf, size);
+  else if (xdp_document_domain_is_dir (inode->domain))
+    res = ENODATA;
+  else
+    res = extattr_list_file (inode->domain->doc_path, EXTATTR_NAMESPACE_USER, buf, size);
 #else
 #error "Not implemented for your platform"
 #endif
-  }
-  else
-    res = 0;
 
   if (res < 0)
     return xdp_reply_err (op, req, errno);
@@ -2990,7 +3062,6 @@ xdp_fuse_removexattr (fuse_req_t req,
                       const char *name)
 {
   g_autoptr(XdpInode) inode = xdp_inode_from_ino (ino);
-  g_autofree char *path = NULL;
   ssize_t res;
   const char *op = "REMOVEXATTR";
 
@@ -3002,11 +3073,11 @@ xdp_fuse_removexattr (fuse_req_t req,
                                   CHECK_IS_PHYSICAL))
     return;
 
-  path = fd_to_path (inode->physical->fd);
 #if defined(HAVE_SYS_XATTR_H)
+  g_autofree char *path = fd_to_path (inode->physical->fd);
   res = removexattr (path, name);
 #elif defined(HAVE_SYS_EXTATTR_H)
-  res = extattr_delete_file (path, EXTATTR_NAMESPACE_USER, name);
+  res = extattr_delete_fd (inode->physical->fd, EXTATTR_NAMESPACE_USER, name);
 #else
 #error "Not implemented for your platform"
 #endif
@@ -3406,25 +3477,17 @@ xdp_fuse_lookup_id_for_inode (ino_t ino, gboolean directory,
       /* But maybe its a subfile of the document */
       if (real_path_out)
         {
-          g_autofree char *fd_path = fd_to_path (physical->fd);
-          char path_buffer[PATH_MAX + 1];
           DevIno file_devino = physical->backing_devino;
-          ssize_t symlink_size;
+          char path_buffer[PATH_MAX + 1];
           struct stat buf;
 
           /* Try to extract a real path to the file (and verify it goes to the same place as the fd) */
-          symlink_size = readlink (fd_path, path_buffer, PATH_MAX);
-          if (symlink_size >= 1)
+          if (lstat_and_realpath_path_fd (physical->fd, &buf, path_buffer) == 0 &&
+              buf.st_dev == file_devino.dev &&
+              buf.st_ino == file_devino.ino)
             {
-              path_buffer[symlink_size] = 0;
-
-              if (lstat (path_buffer, &buf) == 0 &&
-                  buf.st_dev == file_devino.dev &&
-                  buf.st_ino == file_devino.ino)
-                {
-                  *real_path_out = g_strdup (path_buffer);
-                  return g_strdup (domain->doc_id);
-                }
+              *real_path_out = g_strdup (path_buffer);
+              return g_strdup (domain->doc_id);
             }
         }
     }
